@@ -24,7 +24,11 @@ class Config:
     BLENDER_SCRIPT = BASE_DIR / 'bake_all.py'
 
     # Threading pour le bake
-    BAKE_THREADS = int(os.getenv('BAKE_THREADS', str(max(1, (os.cpu_count() or 1) - 2))))
+    # OLD: BAKE_THREADS = int(os.getenv('BAKE_THREADS', str(max(1, (os.cpu_count() or 1) - 2))))
+    BAKE_THREADS = _get_int_env(
+        'BAKE_THREADS',
+        max(1, (os.cpu_count() or 1) - 2)
+    )
 
     # Timing
     HEARTBEAT_INTERVAL = int(os.getenv('HEARTBEAT_INTERVAL', '3'))
@@ -60,6 +64,13 @@ class Config:
     def ensure_dirs(cls):
         cls.WORK_DIR.mkdir(parents=True, exist_ok=True)
         cls.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    @classmethod
+    def _get_int_env(name, default):
+        val = os.getenv(name)
+        if val is None or val.strip() == "":
+            return default
+        return int(val)
 
     @classmethod
     def validate(cls):
