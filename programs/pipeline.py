@@ -1,6 +1,6 @@
 """
 pipeline.py — Pipeline 3 threads pour le cache Blender (batches tar.zst + boto3).
-Fix Storj 411: upload via fichier local (Content-Length garanti sur PutObject ET UploadPart).
+Fix Storj 411: Body=bytes (jamais de file object ni multipart).
 """
 
 import logging
@@ -270,7 +270,8 @@ class BatchUploader:
             config=BotoConfig(
                 signature_version='s3v4',
                 retries={'max_attempts': 5, 'mode': 'adaptive'},
-                s3={'addressing_style': 'path'}
+                s3={'addressing_style': 'path'},
+                request_min_compression_size_bytes=10485760,
             ),
         )
         self._bucket = s3_credentials['bucket']
@@ -315,28 +316,29 @@ class BatchUploader:
     def _upload_batch(self, batch_id: int, batch_file: Path, frames: List[int]):
         key = f"{self.cache_prefix}batch_{batch_id:04d}.tar.zst"
         start = time.time()
-        file_size = batch_file.stat().st_size
 
         try:
-            # Cas 1 : Petit fichier (< Seuil) -> PutObject simple avec open()
-            if file_size <= Config.S3_MULTIPART_THRESHOLD:
-                with open(batch_file, 'rb') as data:
-                    self._s3.put_object(
-                        Bucket=self._bucket,
-                        Key=key,
-                        Body=data,
-                        ContentLength=file_size,
-                        ContentType='application/octet-stream',
-                        Metadata={
-                            'batch_id': str(batch_id),
-                            'frames': ','.join(str(f) for f in frames),
-                            'frame_count': str(len(frames)),
-                        },
-                    )
-            
-            # Cas 2 : Gros fichier -> Multipart manuel (contrôle total)
-            else:
-                self._manual_multipart_upload(key, batch_file, file_size)
+            # ── Fix Storj 411 ─────────────────────────────────────
+            # Storj refuse les requêtes sans Content-Length header.
+            # Passer un file object comme Body → botocore utilise
+            # chunked transfer encoding → pas de Content-Length → 411.
+            # Solution : lire en bytes AVANT d'envoyer.
+            # Pas de multipart non plus (même problème sur UploadPart).
+            # ──────────────────────────────────────────────────────
+            data = batch_file.read_bytes()
+
+            self._s3.put_object(
+                Bucket=self._bucket,
+                Key=key,
+                Body=data,
+                ContentLength=len(data),
+                ContentType='application/octet-stream',
+                Metadata={
+                    'batch_id': str(batch_id),
+                    'frames': ','.join(str(f) for f in frames),
+                    'frame_count': str(len(frames)),
+                },
+            )
 
             duration = time.time() - start
             self.progress.register_secured(batch_id, key, duration)
@@ -345,11 +347,11 @@ class BatchUploader:
             etag = str(head.get('ETag') or '').strip('"')
 
             self._notify_secured(
-                frames=frames, 
-                batch_id=batch_id, 
-                r2_key=key, 
-                upload_speed_bps=int(self.progress.upload_speed_bps), 
-                size=file_size, 
+                frames=frames,
+                batch_id=batch_id,
+                r2_key=key,
+                upload_speed_bps=int(self.progress.upload_speed_bps),
+                size=len(data),
                 etag=etag
             )
 
@@ -361,47 +363,6 @@ class BatchUploader:
         except Exception as e:
             self.progress.register_batch_failed(batch_id)
             logger.error(f"Erreur upload batch #{batch_id}: {e}")
-
-    def _manual_multipart_upload(self, key: str, file_path: Path, file_size: int):
-        """Multipart upload manuel pour garantir les headers (Fix 411)."""
-        mpu = self._s3.create_multipart_upload(
-            Bucket=self._bucket, 
-            Key=key, 
-            ContentType='application/octet-stream'
-        )
-        upload_id = mpu['UploadId']
-        parts = []
-        chunk_size = Config.S3_MULTIPART_CHUNK_SIZE
-
-        try:
-            with open(file_path, 'rb') as f:
-                part_number = 1
-                while True:
-                    data = f.read(chunk_size)
-                    if not data:
-                        break
-                    
-                    # Fix 411: ContentLength explicite pour chaque part
-                    part = self._s3.upload_part(
-                        Bucket=self._bucket,
-                        Key=key,
-                        UploadId=upload_id,
-                        PartNumber=part_number,
-                        Body=data,
-                        ContentLength=len(data)
-                    )
-                    parts.append({'PartNumber': part_number, 'ETag': part['ETag']})
-                    part_number += 1
-
-            self._s3.complete_multipart_upload(
-                Bucket=self._bucket,
-                Key=key,
-                UploadId=upload_id,
-                MultipartUpload={'Parts': parts}
-            )
-        except Exception:
-            self._s3.abort_multipart_upload(Bucket=self._bucket, Key=key, UploadId=upload_id)
-            raise
 
     def _notify_secured(self, frames: List[int], batch_id: int, r2_key: str, upload_speed_bps: int, size: Optional[int] = None, etag: Optional[str] = None):
         if not self.ws_client or not self.ws_client.is_connected():
