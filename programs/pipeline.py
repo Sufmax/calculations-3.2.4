@@ -1,6 +1,6 @@
 """
 pipeline.py — Pipeline 3 threads pour le cache Blender (batches tar.zst + boto3).
-Fix Storj 411: upload via fichier local (Content-Length garanti).
+Fix Storj 411: upload via fichier local (Content-Length garanti sur PutObject ET UploadPart).
 """
 
 import logging
@@ -9,12 +9,11 @@ import threading
 import time
 from pathlib import Path
 from queue import Queue, Empty
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
 
 import boto3
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
-from boto3.s3.transfer import TransferConfig
 
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileSystemEvent
@@ -237,7 +236,6 @@ class BatchCompressor:
 
         self.progress.register_compressed(batch.batch_id, len(compressed), raw_size)
 
-        # Ecrire le batch sur disque (fix 411 : Content-Length garanti)
         self.work_dir.mkdir(parents=True, exist_ok=True)
         batch_file = self.work_dir / f"batch_{batch.batch_id:04d}.tar.zst"
         batch_file.write_bytes(compressed)
@@ -252,7 +250,6 @@ class BatchCompressor:
                 'timestamp': time.time(),
             })
 
-        # Passer au thread upload : (id, filepath, frames)
         self.batch_queue.put((batch.batch_id, batch_file, frames))
         self.update_batch_size()
 
@@ -270,23 +267,18 @@ class BatchUploader:
             aws_access_key_id=s3_credentials['accessKeyId'],
             aws_secret_access_key=s3_credentials['secretAccessKey'],
             region_name=s3_credentials.get('region', 'us-east-1'),
-            config=BotoConfig(signature_version='s3v4', retries={'max_attempts': 5, 'mode': 'adaptive'}),
+            config=BotoConfig(
+                signature_version='s3v4',
+                retries={'max_attempts': 5, 'mode': 'adaptive'},
+                s3={'addressing_style': 'path'}
+            ),
         )
         self._bucket = s3_credentials['bucket']
-
-        # TransferConfig : multipart géré automatiquement + Content-Length connu
-        self._transfer_cfg = TransferConfig(
-            multipart_threshold=Config.S3_MULTIPART_THRESHOLD,
-            multipart_chunksize=Config.S3_MULTIPART_CHUNK_SIZE,
-            max_concurrency=2,
-            use_threads=True,
-        )
-
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
     def start(self):
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread = threading.Thread(target=self._run, daemon=True, name="Uploader")
         self._thread.start()
 
     def stop(self):
@@ -295,29 +287,19 @@ class BatchUploader:
             self._thread.join(timeout=30)
 
     def upload_dict(self, dict_bytes: bytes, work_dir: Path):
-        work_dir.mkdir(parents=True, exist_ok=True)
-        dict_file = work_dir / "dictionary.zstd"
-        dict_file.write_bytes(dict_bytes)
-
         key = f"{self.cache_prefix}dictionary.zstd"
-        self._s3.upload_file(
-            Filename=str(dict_file),
-            Bucket=self._bucket,
-            Key=key,
-            ExtraArgs={'ContentType': 'application/octet-stream', 'Metadata': {'type': 'zstd-dictionary'}},
-            Config=self._transfer_cfg,
-        )
-
-        head = self._s3.head_object(Bucket=self._bucket, Key=key)
-        size = int(head.get('ContentLength') or dict_file.stat().st_size)
-        etag = str(head.get('ETag') or '').strip('"')
-
-        self._notify_secured(frames=[], batch_id=0, r2_key=key, upload_speed_bps=int(self.progress.upload_speed_bps), size=size, etag=etag)
-
         try:
-            dict_file.unlink()
-        except OSError:
-            pass
+            self._s3.put_object(
+                Bucket=self._bucket,
+                Key=key,
+                Body=dict_bytes,
+                ContentLength=len(dict_bytes),
+                ContentType='application/octet-stream',
+                Metadata={'type': 'zstd-dictionary'}
+            )
+            self._notify_secured(frames=[], batch_id=0, r2_key=key, upload_speed_bps=int(self.progress.upload_speed_bps))
+        except Exception as e:
+            logger.error(f"Erreur upload dictionnaire: {e}", exc_info=True)
 
     def _run(self):
         while not self._stop_event.is_set():
@@ -333,40 +315,93 @@ class BatchUploader:
     def _upload_batch(self, batch_id: int, batch_file: Path, frames: List[int]):
         key = f"{self.cache_prefix}batch_{batch_id:04d}.tar.zst"
         start = time.time()
+        file_size = batch_file.stat().st_size
 
         try:
-            self._s3.upload_file(
-                Filename=str(batch_file),
+            # Cas 1 : Petit fichier (< Seuil) -> PutObject simple avec open()
+            if file_size <= Config.S3_MULTIPART_THRESHOLD:
+                with open(batch_file, 'rb') as data:
+                    self._s3.put_object(
+                        Bucket=self._bucket,
+                        Key=key,
+                        Body=data,
+                        ContentLength=file_size,
+                        ContentType='application/octet-stream',
+                        Metadata={
+                            'batch_id': str(batch_id),
+                            'frames': ','.join(str(f) for f in frames),
+                            'frame_count': str(len(frames)),
+                        },
+                    )
+            
+            # Cas 2 : Gros fichier -> Multipart manuel (contrôle total)
+            else:
+                self._manual_multipart_upload(key, batch_file, file_size)
+
+            duration = time.time() - start
+            self.progress.register_secured(batch_id, key, duration)
+
+            head = self._s3.head_object(Bucket=self._bucket, Key=key)
+            etag = str(head.get('ETag') or '').strip('"')
+
+            self._notify_secured(
+                frames=frames, 
+                batch_id=batch_id, 
+                r2_key=key, 
+                upload_speed_bps=int(self.progress.upload_speed_bps), 
+                size=file_size, 
+                etag=etag
+            )
+
+            try:
+                batch_file.unlink()
+            except OSError:
+                pass
+
+        except Exception as e:
+            self.progress.register_batch_failed(batch_id)
+            logger.error(f"Erreur upload batch #{batch_id}: {e}")
+
+    def _manual_multipart_upload(self, key: str, file_path: Path, file_size: int):
+        """Multipart upload manuel pour garantir les headers (Fix 411)."""
+        mpu = self._s3.create_multipart_upload(
+            Bucket=self._bucket, 
+            Key=key, 
+            ContentType='application/octet-stream'
+        )
+        upload_id = mpu['UploadId']
+        parts = []
+        chunk_size = Config.S3_MULTIPART_CHUNK_SIZE
+
+        try:
+            with open(file_path, 'rb') as f:
+                part_number = 1
+                while True:
+                    data = f.read(chunk_size)
+                    if not data:
+                        break
+                    
+                    # Fix 411: ContentLength explicite pour chaque part
+                    part = self._s3.upload_part(
+                        Bucket=self._bucket,
+                        Key=key,
+                        UploadId=upload_id,
+                        PartNumber=part_number,
+                        Body=data,
+                        ContentLength=len(data)
+                    )
+                    parts.append({'PartNumber': part_number, 'ETag': part['ETag']})
+                    part_number += 1
+
+            self._s3.complete_multipart_upload(
                 Bucket=self._bucket,
                 Key=key,
-                ExtraArgs={
-                    'ContentType': 'application/octet-stream',
-                    'Metadata': {
-                        'batch_id': str(batch_id),
-                        'frames': ','.join(str(f) for f in frames),
-                        'frame_count': str(len(frames)),
-                    },
-                },
-                Config=self._transfer_cfg,
+                UploadId=upload_id,
+                MultipartUpload={'Parts': parts}
             )
-        except ClientError as e:
-            logger.error(f"Upload failed batch #{batch_id}: {e}")
-            return
-
-        duration = time.time() - start
-        self.progress.register_secured(batch_id, key, duration)
-
-        head = self._s3.head_object(Bucket=self._bucket, Key=key)
-        size = int(head.get('ContentLength') or batch_file.stat().st_size)
-        etag = str(head.get('ETag') or '').strip('"')
-
-        self._notify_secured(frames=frames, batch_id=batch_id, r2_key=key, upload_speed_bps=int(self.progress.upload_speed_bps), size=size, etag=etag)
-
-        # Nettoyage local (on conserve uniquement si échec)
-        try:
-            batch_file.unlink()
-        except OSError:
-            pass
+        except Exception:
+            self._s3.abort_multipart_upload(Bucket=self._bucket, Key=key, UploadId=upload_id)
+            raise
 
     def _notify_secured(self, frames: List[int], batch_id: int, r2_key: str, upload_speed_bps: int, size: Optional[int] = None, etag: Optional[str] = None):
         if not self.ws_client or not self.ws_client.is_connected():
@@ -429,14 +464,11 @@ class Pipeline:
 
     def finalize(self):
         self.compressor.flush()
-
-        # attendre la queue upload
         timeout = 120.0
         waited = 0.0
         while not self._batch_queue.empty() and waited < timeout:
             time.sleep(0.5)
             waited += 0.5
-
         if self.dict_manager.is_trained and self.dict_manager.dict_bytes:
             self.uploader.upload_dict(self.dict_manager.dict_bytes, self.work_dir)
 
