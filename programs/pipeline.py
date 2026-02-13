@@ -271,7 +271,6 @@ class BatchUploader:
                 signature_version='s3v4',
                 retries={'max_attempts': 5, 'mode': 'adaptive'},
                 s3={'addressing_style': 'path'},
-                request_min_compression_size_bytes=10485760,
             ),
         )
         self._bucket = s3_credentials['bucket']
