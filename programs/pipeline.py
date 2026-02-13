@@ -1,19 +1,26 @@
 """
-pipeline.py — Pipeline 3 threads pour le cache Blender (batches tar.zst + boto3).
-Fix Storj 411: Body=bytes (jamais de file object ni multipart).
+pipeline.py — Pipeline 3 threads pour le cache Blender (batches tar.zst).
+Fix Storj 411: upload HTTP direct avec urllib3 (Content-Length garanti).
 """
 
+import hashlib
+import io
 import logging
 import re
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from queue import Queue, Empty
 from typing import Dict, List, Optional, Set
+from urllib.parse import urlparse
 
 import boto3
+import botocore.auth
+import botocore.credentials
 from botocore.config import Config as BotoConfig
-from botocore.exceptions import ClientError
+
+import urllib3
 
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileSystemEvent
@@ -254,6 +261,99 @@ class BatchCompressor:
         self.update_batch_size()
 
 
+class StorjUploader:
+    """Upload HTTP direct vers Storj avec signature AWS v4 et Content-Length garanti."""
+
+    def __init__(self, endpoint: str, access_key: str, secret_key: str, bucket: str, region: str = 'us-east-1'):
+        self._endpoint = endpoint.rstrip('/')
+        self._bucket = bucket
+        self._region = region
+        self._credentials = botocore.credentials.Credentials(access_key, secret_key)
+        self._signer = botocore.auth.SigV4Auth(self._credentials, 's3', self._region)
+        self._http = urllib3.PoolManager(
+            num_pools=4,
+            maxsize=4,
+            retries=urllib3.Retry(total=3, backoff_factor=1.0),
+        )
+        parsed = urlparse(self._endpoint)
+        self._host = parsed.netloc
+
+    def put_object(self, key: str, data: bytes, content_type: str = 'application/octet-stream', metadata: Optional[Dict[str, str]] = None) -> Dict:
+        """PUT un objet avec Content-Length explicite."""
+        url = f"{self._endpoint}/{self._bucket}/{key}"
+        content_sha256 = hashlib.sha256(data).hexdigest()
+
+        headers = {
+            'Host': self._host,
+            'Content-Type': content_type,
+            'Content-Length': str(len(data)),
+            'x-amz-content-sha256': content_sha256,
+            'x-amz-date': datetime.utcnow().strftime('%Y%m%dT%H%M%SZ'),
+        }
+
+        if metadata:
+            for k, v in metadata.items():
+                headers[f'x-amz-meta-{k}'] = v
+
+        # Signer la requête
+        request = botocore.awsrequest.AWSRequest(
+            method='PUT',
+            url=url,
+            headers=headers,
+            data=data,
+        )
+        self._signer.add_auth(request)
+
+        # Envoyer
+        response = self._http.urlopen(
+            'PUT',
+            url,
+            body=data,
+            headers=dict(request.headers),
+            preload_content=True,
+        )
+
+        if response.status not in (200, 201, 204):
+            raise Exception(
+                f"Storj PUT failed: HTTP {response.status} — {response.data.decode('utf-8', errors='replace')[:500]}"
+            )
+
+        return {
+            'ETag': response.headers.get('ETag', '').strip('"'),
+            'status': response.status,
+        }
+
+    def head_object(self, key: str) -> Dict:
+        """HEAD un objet."""
+        url = f"{self._endpoint}/{self._bucket}/{key}"
+
+        headers = {
+            'Host': self._host,
+            'x-amz-content-sha256': hashlib.sha256(b'').hexdigest(),
+            'x-amz-date': datetime.utcnow().strftime('%Y%m%dT%H%M%SZ'),
+        }
+
+        request = botocore.awsrequest.AWSRequest(
+            method='HEAD',
+            url=url,
+            headers=headers,
+        )
+        self._signer.add_auth(request)
+
+        response = self._http.urlopen(
+            'HEAD',
+            url,
+            headers=dict(request.headers),
+            preload_content=True,
+        )
+
+        return {
+            'ETag': response.headers.get('ETag', '').strip('"'),
+            'ContentLength': int(response.headers.get('Content-Length', 0)),
+            'status': response.status,
+        }
+
+
 class BatchUploader:
     def __init__(self, batch_queue: Queue, progress: ProgressTracker, s3_credentials: Dict, ws_client, cache_prefix: str):
         self.batch_queue = batch_queue
@@ -261,19 +361,13 @@ class BatchUploader:
         self.ws_client = ws_client
         self.cache_prefix = cache_prefix
 
-        self._s3 = boto3.client(
-            's3',
-            endpoint_url=s3_credentials['endpoint'],
-            aws_access_key_id=s3_credentials['accessKeyId'],
-            aws_secret_access_key=s3_credentials['secretAccessKey'],
-            region_name=s3_credentials.get('region', 'us-east-1'),
-            config=BotoConfig(
-                signature_version='s3v4',
-                retries={'max_attempts': 5, 'mode': 'adaptive'},
-                s3={'addressing_style': 'path'},
-            ),
+        self._storj = StorjUploader(
+            endpoint=s3_credentials['endpoint'],
+            access_key=s3_credentials['accessKeyId'],
+            secret_key=s3_credentials['secretAccessKey'],
+            bucket=s3_credentials['bucket'],
+            region=s3_credentials.get('region', 'us-east-1'),
         )
-        self._bucket = s3_credentials['bucket']
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
@@ -289,13 +383,10 @@ class BatchUploader:
     def upload_dict(self, dict_bytes: bytes, work_dir: Path):
         key = f"{self.cache_prefix}dictionary.zstd"
         try:
-            self._s3.put_object(
-                Bucket=self._bucket,
-                Key=key,
-                Body=dict_bytes,
-                ContentLength=len(dict_bytes),
-                ContentType='application/octet-stream',
-                Metadata={'type': 'zstd-dictionary'}
+            self._storj.put_object(
+                key=key,
+                data=dict_bytes,
+                metadata={'type': 'zstd-dictionary'},
             )
             self._notify_secured(frames=[], batch_id=0, r2_key=key, upload_speed_bps=int(self.progress.upload_speed_bps))
         except Exception as e:
@@ -317,33 +408,22 @@ class BatchUploader:
         start = time.time()
 
         try:
-            # ── Fix Storj 411 ─────────────────────────────────────
-            # Storj refuse les requêtes sans Content-Length header.
-            # Passer un file object comme Body → botocore utilise
-            # chunked transfer encoding → pas de Content-Length → 411.
-            # Solution : lire en bytes AVANT d'envoyer.
-            # Pas de multipart non plus (même problème sur UploadPart).
-            # ──────────────────────────────────────────────────────
             data = batch_file.read_bytes()
 
-            self._s3.put_object(
-                Bucket=self._bucket,
-                Key=key,
-                Body=data,
-                ContentLength=len(data),
-                ContentType='application/octet-stream',
-                Metadata={
-                    'batch_id': str(batch_id),
+            result = self._storj.put_object(
+                key=key,
+                data=data,
+                metadata={
+                    'batch-id': str(batch_id),
                     'frames': ','.join(str(f) for f in frames),
-                    'frame_count': str(len(frames)),
+                    'frame-count': str(len(frames)),
                 },
             )
 
             duration = time.time() - start
             self.progress.register_secured(batch_id, key, duration)
 
-            head = self._s3.head_object(Bucket=self._bucket, Key=key)
-            etag = str(head.get('ETag') or '').strip('"')
+            etag = result.get('ETag', '')
 
             self._notify_secured(
                 frames=frames,
@@ -351,7 +431,7 @@ class BatchUploader:
                 r2_key=key,
                 upload_speed_bps=int(self.progress.upload_speed_bps),
                 size=len(data),
-                etag=etag
+                etag=etag,
             )
 
             try:
